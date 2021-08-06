@@ -20,6 +20,10 @@ type EventDispatcher struct {
 	listeners []chan<- interface{}
 }
 
+func (e *EventDispatcher) Notify() {
+	e.Emit(nil)
+}
+
 func (e *EventDispatcher) Emit(data interface{}) {
 	e.mtx.Lock()
 	defer e.mtx.Unlock()
