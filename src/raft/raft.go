@@ -171,7 +171,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// DPrintf("[%d] cond install snapshot, lastTerm=%d lastIndex=%d myLastTerm=%d myLastIndex=%d\n", rf.me, lastIncludedTerm, lastIncludedIndex, rf.snapshotLastIncludedTerm, rf.snapshotLastIncludedIndex)
-	if rf.snapshotLastIncludedIndex >= lastIncludedIndex {
+	if rf.lastApplied >= lastIncludedIndex {
 		// DPrintf("[%d] snapshot too old\n", rf.me)
 		return false
 	}
@@ -184,6 +184,17 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.snapshotLastIncludedTerm = lastIncludedTerm
 	rf.snapshot = snapshot
 	rf.lastApplied = lastIncludedIndex
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.snapshotLastIncludedIndex)
+	e.Encode(rf.snapshotLastIncludedTerm)
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
+
 	rf.needApply.Notify()
 
 	return true
@@ -198,12 +209,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if index <= rf.snapshotLastIncludedIndex {
-		panic("snapshot too old")
+		// DPrintf("[%d] snapshot too old (index=%d lastIncludedIndex=%d), skip\n", rf.me, index, rf.snapshotLastIncludedIndex)
+		return
 	}
 	rf.snapshotLastIncludedTerm = rf.log[index-rf.snapshotLastIncludedIndex-1].Term
 	rf.log = rf.log[index-rf.snapshotLastIncludedIndex:]
 	rf.snapshotLastIncludedIndex = index
 	rf.snapshot = snapshot
+	rf.lastApplied = rf.snapshotLastIncludedIndex
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -558,6 +571,8 @@ func (rf *Raft) Kill() {
 	for i := range rf.peers {
 		rf.needLogReplication[i].Notify()
 	}
+	rf.needApply.Notify()
+	// close(rf.applyCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -828,8 +843,22 @@ func (rf *Raft) checkCommits() {
 	}
 	sort.Slice(matchIndexes, func(i, j int) bool { return matchIndexes[i] > matchIndexes[j] })
 	nextCommitIndex := matchIndexes[len(rf.peers)/2-1]
-	if nextCommitIndex > rf.commitIndex && rf.log[nextCommitIndex-rf.snapshotLastIncludedIndex-1].Term == rf.currentTerm {
+	if nextCommitIndex <= rf.commitIndex {
+		return
+	}
+
+	var nextCommitTerm int
+	if nextCommitIndex == rf.snapshotLastIncludedIndex {
+		nextCommitTerm = rf.snapshotLastIncludedTerm
+	} else if nextCommitIndex > rf.snapshotLastIncludedIndex {
+		nextCommitTerm = rf.log[nextCommitIndex-rf.snapshotLastIncludedIndex-1].Term
+	} else {
+		panic("next commit must be outside snapshot")
+	}
+
+	if nextCommitTerm == rf.currentTerm {
 		rf.commitIndex = nextCommitIndex
+		// DPrintf("[%d] now commitIndex=%d will apply\n", rf.me, rf.commitIndex)
 		rf.needApply.Notify()
 	}
 }
@@ -842,6 +871,7 @@ func (rf *Raft) applyRoutine() {
 		}
 
 		rf.mu.Lock()
+		// DPrintf("[%d] applyRoutine commitIndex=%d lastApplied=%d\n", rf.me, rf.commitIndex, rf.lastApplied)
 		if rf.lastApplied >= rf.commitIndex {
 			rf.mu.Unlock()
 			notDone = false
@@ -857,11 +887,20 @@ func (rf *Raft) applyRoutine() {
 			SnapshotValid: false,
 		}
 		// DPrintf("[%d] will apply index %d log %v\n", rf.me, index, rf.log[index - rf.snapshotLastIncludedIndex- 1].Cmd)
+		// DPrintf("[%d] my logs: {... %d, %d}, %v\n", rf.me, rf.snapshotLastIncludedIndex, rf.snapshotLastIncludedTerm, rf.log)
+
 		rf.mu.Unlock()
+		// if rf.killed() {
+		// 	close(rf.applyCh)
+		// 	return
+		// }
 		rf.applyCh <- msg
 		rf.mu.Lock()
 		if rf.lastApplied < index-1 {
-			panic("inconsistent")
+			// DPrintf("inconsistent, skip")
+			rf.mu.Unlock()
+			notDone = true
+			continue
 		}
 
 		if rf.lastApplied == index-1 {
@@ -870,6 +909,7 @@ func (rf *Raft) applyRoutine() {
 		notDone = rf.lastApplied < rf.commitIndex
 		rf.mu.Unlock()
 	}
+	// close(rf.applyCh)
 }
 
 //
@@ -906,6 +946,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.lastApplied = rf.snapshotLastIncludedIndex
+	rf.snapshot = persister.ReadSnapshot()
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
